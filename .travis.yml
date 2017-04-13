@@ -155,7 +155,7 @@ script:
   - composer validate --no-check-lock
   - cd framework && composer validate --no-check-lock && cd ..
   # run PHPUnit
-  - vendor/bin/phpunit --verbose $PHPUNIT_FLAGS --exclude-group mssql,oci,wincache,xcache,zenddata,cubrid
+  - phpunit --verbose $PHPUNIT_FLAGS --exclude-group mssql,oci,wincache,xcache,zenddata,cubrid
 
 after_script:
   - |
