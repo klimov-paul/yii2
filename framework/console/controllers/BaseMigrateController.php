@@ -17,6 +17,7 @@ use yii\console\ExitCode;
 use yii\db\MigrationInterface;
 use yii\helpers\Console;
 use yii\helpers\FileHelper;
+use yii\helpers\VarDumper;
 
 /**
  * BaseMigrateController is the base class for migrate controllers.
@@ -90,6 +91,19 @@ abstract class BaseMigrateController extends Controller
      * @since 2.0.13
      */
     public $compact = false;
+    /**
+     * @var string|null name of the file, which should be used for migration aliases storage.
+     * Yii path aliases can be used for it, for example: '@app/migrations/aliases.php'.
+     * If not set migration version aliases tracking will be disabled.
+     * @since 2.0.14
+     */
+    public $migrationAliasesFile;
+
+    /**
+     * @var array migration version aliases in format: `[stored-version => alias]`
+     * @since 2.0.14
+     */
+    private $_migrationAliases;
 
 
     /**
@@ -99,7 +113,7 @@ abstract class BaseMigrateController extends Controller
     {
         return array_merge(
             parent::options($actionID),
-            ['migrationPath', 'migrationNamespaces', 'compact'], // global for all actions
+            ['migrationPath', 'migrationNamespaces', 'compact', 'migrationAliasesFile'], // global for all actions
             $actionID === 'create' ? ['templateFile'] : [] // action create
         );
     }
@@ -195,19 +209,25 @@ abstract class BaseMigrateController extends Controller
 
         $applied = 0;
         if ($this->confirm('Apply the above ' . ($n === 1 ? 'migration' : 'migrations') . '?')) {
+            $migrationAliases = [];
             foreach ($migrations as $migration) {
                 if (!$this->migrateUp($migration)) {
                     $this->stdout("\n$applied from $n " . ($applied === 1 ? 'migration was' : 'migrations were') . " applied.\n", Console::FG_RED);
                     $this->stdout("\nMigration failed. The rest of the migrations are canceled.\n", Console::FG_RED);
 
+                    $this->saveMigrationAliases($migrationAliases);
                     return ExitCode::UNSPECIFIED_ERROR;
                 }
+                $migrationAliases[$migration] = $migration;
                 $applied++;
             }
 
             $this->stdout("\n$n " . ($n === 1 ? 'migration was' : 'migrations were') . " applied.\n", Console::FG_GREEN);
+            $this->saveMigrationAliases($migrationAliases);
             $this->stdout("\nMigrated up successfully.\n", Console::FG_GREEN);
         }
+
+        return ExitCode::OK;
     }
 
     /**
@@ -250,8 +270,14 @@ abstract class BaseMigrateController extends Controller
 
         $n = count($migrations);
         $this->stdout("Total $n " . ($n === 1 ? 'migration' : 'migrations') . " to be reverted:\n", Console::FG_YELLOW);
-        foreach ($migrations as $migration) {
-            $this->stdout("\t$migration\n");
+        foreach ($migrations as $key => $version) {
+            $migration = $this->getMigrationVersionAlias($version);
+            if ($migration === $version) {
+                $this->stdout("\t$migration\n");
+            } else {
+                $this->stdout("\t$version ($migration)\n");
+                $migrations[$key] = $migration;
+            }
         }
         $this->stdout("\n");
 
@@ -312,8 +338,14 @@ abstract class BaseMigrateController extends Controller
 
         $n = count($migrations);
         $this->stdout("Total $n " . ($n === 1 ? 'migration' : 'migrations') . " to be redone:\n", Console::FG_YELLOW);
-        foreach ($migrations as $migration) {
-            $this->stdout("\t$migration\n");
+        foreach ($migrations as $key => $version) {
+            $migration = $this->getMigrationVersionAlias($version);
+            if ($migration === $version) {
+                $this->stdout("\t$migration\n");
+            } else {
+                $this->stdout("\t$version ($migration)\n");
+                $migrations[$key] = $migration;
+            }
         }
         $this->stdout("\n");
 
@@ -408,15 +440,18 @@ abstract class BaseMigrateController extends Controller
 
         // try mark up
         $migrations = $this->getNewMigrations();
+        $migrationAliases = [];
         foreach ($migrations as $i => $migration) {
             if (strpos($migration, $version) === 0) {
                 if ($this->confirm("Set migration history at $originalVersion?")) {
                     for ($j = 0; $j <= $i; ++$j) {
                         $this->addMigrationHistory($migrations[$j]);
+                        $migrationAliases[$migrations[$j]] = $migrations[$j];
                     }
                     $this->stdout("The migration history is set at $originalVersion.\nNo actual migration was performed.\n", Console::FG_GREEN);
                 }
 
+                $this->saveMigrationAliases($migrationAliases);
                 return ExitCode::OK;
             }
         }
@@ -538,7 +573,8 @@ abstract class BaseMigrateController extends Controller
                 $this->stdout("Total $n " . ($n === 1 ? 'migration has' : 'migrations have') . " been applied before:\n", Console::FG_YELLOW);
             }
             foreach ($migrations as $version => $time) {
-                $this->stdout("\t(" . date('Y-m-d H:i:s', $time) . ') ' . $version . "\n");
+                $migration = $this->getMigrationVersionAlias($version);
+                $this->stdout("\t(" . date('Y-m-d H:i:s', $time) . ') ' . ($migration === $version ? $version : "$version ($migration)") . "\n");
             }
         }
     }
@@ -899,15 +935,17 @@ abstract class BaseMigrateController extends Controller
                 if ($file === '.' || $file === '..') {
                     continue;
                 }
+
                 $path = $migrationPath . DIRECTORY_SEPARATOR . $file;
                 if (preg_match('/^(m(\d{6}_?\d{6})\D.*?)\.php$/is', $file, $matches) && is_file($path)) {
                     $class = $matches[1];
                     if (!empty($namespace)) {
                         $class = $namespace . '\\' . $class;
                     }
+                    $version = $this->getMigrationAliasVersion($class);
                     $time = str_replace('_', '', $matches[2]);
-                    if (!isset($applied[$class])) {
-                        $migrations[$time . '\\' . $class] = $class;
+                    if (!isset($applied[$version])) {
+                        $migrations[$time . '\\' . $version] = $version;
                     }
                 }
             }
@@ -975,4 +1013,153 @@ abstract class BaseMigrateController extends Controller
      * @param string $version migration version name.
      */
     abstract protected function removeMigrationHistory($version);
+
+    // Migration Aliases :
+
+    /**
+     * Returns available migration aliases.
+     * @return array migration aliases in format: `[stored-version => alias]`
+     * @since 2.0.14
+     */
+    public function getMigrationAliases()
+    {
+        if ($this->_migrationAliases === null) {
+            $this->_migrationAliases = [];
+
+            if ($this->migrationAliasesFile !== null) {
+                $fileName = Yii::getAlias($this->migrationAliasesFile);
+                if (file_exists($fileName)) {
+                    $this->_migrationAliases = require $fileName;
+                }
+            }
+        }
+
+        return $this->_migrationAliases;
+    }
+
+    /**
+     * Picks up migration alias from the [[migrationAliasesFile]].
+     * @param string $version migration stored version.
+     * @return string migration alias.
+     * @since 2.0.14
+     */
+    protected function getMigrationVersionAlias($version)
+    {
+        $aliases = $this->getMigrationAliases();
+
+        if (isset($aliases[$version])) {
+            return $aliases[$version];
+        }
+
+        return $version;
+    }
+
+    /**
+     * Picks up migration version from the [[migrationAliasesFile]].
+     * @param string $alias migration alias
+     * @return string migration version.
+     * @since 2.0.14
+     */
+    protected function getMigrationAliasVersion($alias)
+    {
+        $aliases = $this->getMigrationAliases();
+
+        $version = array_search($alias, $aliases, true);
+
+        if ($version === false) {
+            return $alias;
+        }
+
+        return $version;
+    }
+
+    /**
+     * Generates migration aliases file from the migration history.
+     * @return int the status of the action execution. 0 means normal, other values mean abnormal.
+     * @since 2.0.14
+     */
+    public function actionAliasesFile()
+    {
+        if ($this->migrationAliasesFile === false) {
+            $this->stdout("\nThe migration aliases file name must be specified.\n", Console::FG_RED);
+            return ExitCode::USAGE;
+        }
+
+        $migrations = $this->getMigrationHistory(null);
+        $migrations = array_keys($migrations);
+        $aliases = array_combine(array_values($migrations), $migrations);
+        $this->saveMigrationAliases($aliases, true);
+
+        return ExitCode::OK;
+    }
+
+    /**
+     * Saves migration aliases into a file.
+     * @param array $aliases new migration aliases to be saved.
+     * @param bool $force whether to save file even with empty or unchanged data.
+     * @since 2.0.14
+     */
+    protected function saveMigrationAliases(array $aliases, $force = false)
+    {
+        if ($this->migrationAliasesFile === null) {
+            return;
+        }
+
+        if (!$force && empty($aliases)) {
+            return;
+        }
+
+        $fileName = Yii::getAlias($this->migrationAliasesFile);
+
+        if (file_exists($fileName)) {
+            $existingAliases = require $fileName;
+        } else {
+            $existingAliases = [];
+        }
+
+        $aliases = array_merge($existingAliases, $aliases);
+
+        if (!$force && $aliases == $existingAliases) {
+            return;
+        }
+
+        ksort($aliases);
+        $aliases = VarDumper::dumpAsString($aliases);
+
+        $fileContent = <<<PHP
+<?php
+/**
+ * Migration version aliases.
+ *
+ * This file is automatically generated by 'yii {$this->id}' command.
+ * It contains the migration version aliases in format `[stored-version => alias]`.
+ * You may modify this file specifying aliases for the migrations, which name has been changed.
+ * For example: in case you have an old migration 'm20171203_000000_foo' renamed to 'app\migrations\M20171203000000Foo',
+ * you should find the line with key 'm20171203_000000_foo' and specify 'app\migrations\M20171203000000Foo' as its value.
+ *
+ * ATTENTION: make sure this file is tracked by version control system (e.g. GIT, Mercurial, etc.) and you commit
+ * its changes after migration application.
+ *
+ * NOTE: this file must be saved in UTF-8 encoding.
+ */
+
+return {$aliases};
+PHP;
+
+        $bytesWritten = file_put_contents($fileName, $fileContent, LOCK_EX);
+
+        if ($bytesWritten > 0) {
+            $this->stdout("Aliases file saved into '{$fileName}'. Do not forget to commit changes into your VCS.\n", Console::FG_GREEN);
+
+            // invalidate script cache :
+            if (function_exists('opcache_invalidate')) {
+                opcache_invalidate($fileName, true);
+            }
+            if (function_exists('apc_delete_file')) {
+                @apc_delete_file($fileName);
+            }
+        } else {
+            $this->stdout("Unable to save aliases file into '{$fileName}'!\n", Console::FG_RED);
+        }
+    }
 }
